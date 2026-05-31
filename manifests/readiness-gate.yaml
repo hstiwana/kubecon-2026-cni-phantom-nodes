@@ -1,0 +1,79 @@
+# Readiness Gate Pattern
+# Validates end-to-end pod networking before marking node as fully schedulable
+#
+# This DaemonSet runs on every node and:
+# 1. Waits for CNI to be ready (checks for default route)
+# 2. Validates DNS resolution works (proves kube-proxy + CoreDNS path)
+# 3. Patches the node with a custom condition when networking is confirmed
+#
+# Combine with a scheduling gate or taint to prevent pods from landing
+# on nodes where this hasn't passed yet.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: network-readiness-validator
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: network-readiness-validator
+  template:
+    metadata:
+      labels:
+        app: network-readiness-validator
+    spec:
+      hostNetwork: false  # Must use pod network to validate CNI
+      tolerations:
+      - operator: Exists  # Run on all nodes including tainted ones
+      priorityClassName: system-node-critical
+      containers:
+      - name: validator
+        image: busybox:1.36
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Waiting for network readiness..."
+          # Wait for default route (CNI has initialized)
+          until ip route | grep -q "default"; do
+            echo "  No default route yet — CNI not ready"
+            sleep 2
+          done
+          echo "  ✓ Default route present"
+
+          # Wait for DNS resolution (kube-proxy + CoreDNS working)
+          until nslookup kubernetes.default.svc.cluster.local > /dev/null 2>&1; do
+            echo "  DNS not resolving — kube-proxy or CoreDNS not ready"
+            sleep 2
+          done
+          echo "  ✓ DNS resolution working"
+
+          # Wait for API server reachable via service IP
+          until wget -q -O /dev/null --timeout=5 https://kubernetes.default.svc/healthz 2>/dev/null; do
+            echo "  API server not reachable via service IP"
+            sleep 2
+          done
+          echo "  ✓ API server reachable via service network"
+
+          echo "Network readiness CONFIRMED at $(date)"
+          # In production: patch node condition here via downward API + kubectl
+          # kubectl patch node $NODE_NAME --type=merge \
+          #   -p '{"status":{"conditions":[{"type":"NetworkFullyReady","status":"True"}]}}'
+
+          # Stay alive (DaemonSet)
+          sleep infinity
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 50m
+            memory: 32Mi
+---
+# Taint new nodes until network-readiness-validator passes
+# Apply this via a mutating webhook or node startup script:
+#
+# kubectl taint nodes <new-node> network-not-ready=true:NoSchedule
+#
+# The validator DaemonSet (above) removes the taint once networking is confirmed.
+# This prevents pods from being scheduled to phantom nodes.

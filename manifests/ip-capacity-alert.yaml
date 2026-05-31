@@ -1,0 +1,72 @@
+# Prometheus alert for IP capacity forecasting
+# Alert before you run out of IPs during scale-up
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cni-ip-capacity-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+  - name: cni-ip-capacity
+    rules:
+    # Alert when available IPs drop below 20% of total pool
+    - alert: PodIPPoolNearExhaustion
+      expr: |
+        (cilium_ip_addresses_available / (cilium_ip_addresses_available + cilium_ip_addresses_allocated)) < 0.2
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod IP pool is {{ $value | humanizePercentage }} available on {{ $labels.node }}"
+        description: >
+          Less than 20% of pod IPs remain on node {{ $labels.node }}.
+          Next scale-up may fail with IP exhaustion. Consider expanding
+          the pod CIDR or adding subnets.
+
+    # Alert when a node has been NotReady for >3 minutes
+    - alert: PhantomNodeDetected
+      expr: |
+        kube_node_status_condition{condition="Ready", status="true"} == 0
+        and on(node) kube_node_info
+      for: 3m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Node {{ $labels.node }} is NotReady for >3 minutes (phantom node)"
+        description: >
+          Node {{ $labels.node }} has been NotReady for over 3 minutes.
+          It is billing but cannot serve workloads. Investigate CNI
+          initialization or consider replacing via Karpenter disruption.
+
+    # Alert on pods stuck in ContainerCreating
+    - alert: PodsStuckInContainerCreating
+      expr: |
+        count(kube_pod_status_phase{phase="Pending"} == 1
+          and on(pod, namespace) kube_pod_container_status_waiting_reason{reason="ContainerCreating"} == 1
+        ) > 5
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "{{ $value }} pods stuck in ContainerCreating — possible CNI/IP issue"
+        description: >
+          Multiple pods are stuck in ContainerCreating state. This typically
+          indicates IP exhaustion or CNI initialization failure. Check
+          available IPs and CNI DaemonSet health.
+
+    # Track time from node creation to first pod scheduled
+    # (requires custom metric from readiness-gate validator)
+    - alert: SlowNodeReadiness
+      expr: |
+        node_network_ready_duration_seconds > 120
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Node {{ $labels.node }} took {{ $value }}s to become network-ready"
+        description: >
+          Node took over 2 minutes from launch to full network readiness.
+          Investigate CNI init chain: interface attachment, IP allocation,
+          kube-proxy startup.
